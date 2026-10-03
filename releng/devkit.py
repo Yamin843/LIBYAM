@@ -242,14 +242,6 @@ class CompilerApplication:
         meson_config = self.meson_config
 
         ar = meson_config.get("ar", ["ar"])
-        # Prefer llvm-ar for large archives (GNU ar OOMs on V8-scale)
-        for candidate in ("llvm-ar", "llvm-ar-14", "llvm-ar-15", "llvm-ar-16", "llvm-ar-17", "llvm-ar-18"):
-            try:
-                subprocess.run([candidate, "--version"], capture_output=True, check=True)
-                ar = [candidate]
-                break
-            except (FileNotFoundError, subprocess.CalledProcessError):
-                continue
         ar_help = subprocess.run(ar + ["--help"],
                                  stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT,
@@ -276,33 +268,16 @@ class CompilerApplication:
             for library_path in library_paths:
                 scratch_dir = Path(tempfile.mkdtemp(prefix="devkit"))
 
-                # Read member list first (deterministic, works on every ar flavor)
-                listing = subprocess.run(ar + ["t", library_path],
-                                         capture_output=True,
-                                         encoding="utf-8",
-                                         check=True).stdout
-
-                for raw_name in listing.split("\n"):
-                    member_name = raw_name.strip()
-                    if not member_name:
-                        continue
-                    # Extract this member individually: `ar p` never skips dot-names
-                    data = subprocess.run(ar + ["p", library_path, member_name],
-                                          capture_output=True,
-                                          check=True).stdout
-
-                    # Normalize: strip leading dots (ar/ld mishandle members whose
-                    # names begin with '.'; they are silently dropped by some ar
-                    # implementations when using `ar x`)
-                    clean_name = member_name.lstrip('.')
-                    if not clean_name:
-                        clean_name = "unnamed.bin"
-                    while clean_name in object_names:
-                        clean_name = "_" + clean_name
-                    object_names.add(clean_name)
-
-                    with open(combined_dir / clean_name, 'wb') as f:
-                        f.write(data)
+                subprocess.run(ar + ["x", library_path],
+                               cwd=scratch_dir,
+                               capture_output=True,
+                               check=True)
+                for object_name in [entry.name for entry in scratch_dir.iterdir() if entry.name.endswith(".o")]:
+                    object_path = scratch_dir / object_name
+                    while object_name in object_names:
+                        object_name = "_" + object_name
+                    object_names.add(object_name)
+                    shutil.move(object_path, combined_dir / object_name)
 
                 shutil.rmtree(scratch_dir)
 

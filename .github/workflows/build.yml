@@ -1,0 +1,347 @@
+name: LIBYAM Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h /
+
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/android-ndk-r29
+          key: ndk-r29-v2
+
+      - name: Cache subprojects
+        uses: actions/cache@v4
+        with:
+          path: subprojects/packagecache
+          key: subprojects-yam-v1
+          restore-keys: subprojects-
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-yam-v1-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-yam-v1-${{ runner.os }}-
+            ccache-v2-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git curl wget unzip ccache \
+            python3-pip python3-venv pkg-config \
+            ninja-build cmake meson gperf bison flex \
+            autoconf automake libtool gettext libtool-bin
+
+      - name: Install Python deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install tomlkit colorama
+
+      - name: Configure ccache
+        run: |
+          ccache --version
+          ccache --set-config=max_size=5G
+          ccache --set-config=compression=true
+          ccache --set-config=sloppiness=time_macros,include_file_ctime,include_file_mtime,locale,pch_defines
+          ccache --zero-stats
+
+      - name: Download NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          cd $HOME
+          wget -c "https://tb-build-06.torproject.org/~tb-builder/tor-browser-build/out/android-ndk/android-ndk-r29-linux.zip" -O android-ndk-r29-linux.zip
+          unzip -q android-ndk-r29-linux.zip
+          rm android-ndk-r29-linux.zip
+
+      - name: Set env
+        run: |
+          echo "ANDROID_NDK_ROOT=$HOME/android-ndk-r29" >> $GITHUB_ENV
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+          echo "CCACHE_NOHASHDIR=true" >> $GITHUB_ENV
+          echo "CCACHE_SLOPPINESS=time_macros,include_file_ctime,include_file_mtime,locale,pch_defines" >> $GITHUB_ENV
+          echo "CCACHE_COMPRESS=true" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=5G" >> $GITHUB_ENV
+
+      - name: Wrap NDK compilers with ccache
+        run: |
+          set -e
+          NDK_BIN="$HOME/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ ! -f "$NDK_BIN/real-clang" ]; then mv "$NDK_BIN/clang" "$NDK_BIN/real-clang"; fi
+          if [ ! -f "$NDK_BIN/real-clang++" ]; then mv "$NDK_BIN/clang++" "$NDK_BIN/real-clang++"; fi
+          printf '#!/bin/sh\nexec ccache "%s/real-clang" --driver-mode=gcc "$@"\n' "$NDK_BIN" > "$NDK_BIN/clang"
+          chmod +x "$NDK_BIN/clang"
+          printf '#!/bin/sh\nexec ccache "%s/real-clang" --driver-mode=g++ "$@"\n' "$NDK_BIN" > "$NDK_BIN/clang++"
+          chmod +x "$NDK_BIN/clang++"
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -o pipefail
+          cd $GITHUB_WORKSPACE
+          ./configure --host=android-arm64 \
+            --without-prebuilds=toolchain,sdk \
+            -- \
+            -Ddevkits=gum,gumjs \
+            -Dgumjs=enabled \
+            -Dquickjs=enabled \
+            -Dv8=enabled \
+            -Ddatabase=auto \
+            -Dgumpp=enabled \
+            2>&1 | tee /tmp/configure.log
+
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          cd $GITHUB_WORKSPACE
+          make -j$(nproc) 2>&1 | tee /tmp/make.log
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Install to staging
+        if: success()
+        shell: bash
+        run: |
+          set -o pipefail
+          cd $GITHUB_WORKSPACE
+          sudo make install DESTDIR=/tmp/staging 2>&1 | tee /tmp/install.log
+
+      - name: Fix staging ownership
+        if: success()
+        run: sudo chown -R $(id -un):$(id -gn) /tmp/staging
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-yam-v1-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Verify raw devkit
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          GD=/tmp/staging/usr/local/lib/frida-1.0/devkits/gum
+          GJD=/tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs
+          ls -lh "$GD/libyam.a" "$GD/YAM.h" "$GD/YAM-example.c"
+          ls -lh "$GJD/libyamjs.a" "$GJD/YAMJS.h" "$GJD/YAMJS-example.c"
+
+      - name: Bundle gumpp headers
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          SRC=$GITHUB_WORKSPACE/bindings/gumpp
+          DST_GUM=/tmp/staging/usr/local/lib/frida-1.0/devkits/gum
+          DST_GUMJS=/tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs
+          for f in "$SRC"/*.hpp; do
+            [ -f "$f" ] || continue
+            cp "$f" "$DST_GUM/"
+            cp "$f" "$DST_GUMJS/"
+          done
+          echo "Bundled $(ls $DST_GUM/*.hpp | wc -l) hpp files"
+
+      - name: Obfuscate archives
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          cd $GITHUB_WORKSPACE
+          echo "=== BEFORE ==="
+          for lib in /tmp/staging/usr/local/lib/frida-1.0/devkits/gum/libyam.a \
+                     /tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs/libyamjs.a; do
+            echo "$lib: $(du -h $lib | awk '{print $1}'), frida=$(strings $lib | grep -cE '\bfrida\b'), gum=$(strings $lib | grep -cE '\bgum\b')"
+          done
+          echo ""
+          for arc in $(find /tmp/staging -name "*.a" -type f); do
+            python3 tools/obfuscation/obfuscate_archive.py "$arc" || echo "  FAILED: $arc"
+          done
+          echo ""
+          echo "=== AFTER ==="
+          for lib in /tmp/staging/usr/local/lib/frida-1.0/devkits/gum/libyam.a \
+                     /tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs/libyamjs.a; do
+            echo "$lib: $(du -h $lib | awk '{print $1}'), frida=$(strings $lib | grep -cE '\bfrida\b'), gum=$(strings $lib | grep -cE '\bgum\b'), yam=$(strings $lib | grep -c 'yam')"
+          done
+
+      - name: Obfuscate headers
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          GD=/tmp/staging/usr/local/lib/frida-1.0/devkits/gum
+          GJD=/tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs
+          python3 tools/obfuscation/obfuscate_header.py "$GD/YAM.h" "$GJD/YAMJS.h"
+          for hpp in "$GD"/*.hpp "$GJD"/*.hpp; do
+            [ -f "$hpp" ] && python3 tools/obfuscation/obfuscate_header.py "$hpp"
+          done
+          for ex in "$GD"/YAM-example.c "$GJD"/YAMJS-example.c; do
+            [ -f "$ex" ] && python3 tools/obfuscation/obfuscate_header.py "$ex"
+          done
+
+      - name: Merge V8 + QuickJS into libyamjs.a
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          DEVKIT="/tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs"
+          LIBROOT="/tmp/staging/usr/local/lib"
+          echo "=== Before merge ==="
+          echo "  libyamjs.a: $(du -h $DEVKIT/libyamjs.a | awk '{print $1}'), $(ar t $DEVKIT/libyamjs.a | wc -l) members"
+          WORK=$(mktemp -d)
+          mkdir -p "$WORK/yam" "$WORK/v8" "$WORK/qjs" "$WORK/merged"
+          cd "$WORK/yam" && ar x "$DEVKIT/libyamjs.a"
+          cd "$WORK/v8" && ar x "$LIBROOT/libv8-10.0.a" 2>/dev/null || true
+          cd "$WORK/qjs" && ar x "$LIBROOT/libquickjs.a" 2>/dev/null || true
+          cd "$WORK"
+          for subdir in yam v8 qjs; do
+            for f in "$subdir"/*.o; do
+              [ -f "$f" ] || continue
+              base=$(basename "$f")
+              target="$WORK/merged/$base"
+              n=0
+              while [ -e "$target" ]; do n=$((n+1)); target="$WORK/merged/${n}_${base}"; done
+              mv "$f" "$target"
+            done
+          done
+          cd "$WORK/merged"
+          echo "  total members: $(ls *.o | wc -l)"
+          ls *.o > _list.txt
+          llvm-ar rcs "$WORK/libyamjs_merged.a" @_list.txt
+          mv "$WORK/libyamjs_merged.a" "$DEVKIT/libyamjs.a"
+          cd / && rm -rf "$WORK"
+          echo "=== After merge: libyamjs.a $(du -h $DEVKIT/libyamjs.a | awk '{print $1}'), $(ar t $DEVKIT/libyamjs.a | wc -l) members ==="
+
+      - name: Final verification
+        if: success()
+        shell: bash
+        run: |
+          GD=/tmp/staging/usr/local/lib/frida-1.0/devkits/gum
+          GJD=/tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs
+          echo "=== libyam.a (gum-only) ==="
+          echo "  size:    $(du -h $GD/libyam.a | awk '{print $1}')"
+          echo "  members: $(ar t $GD/libyam.a | wc -l)"
+          echo "  frida:   $(strings $GD/libyam.a | grep -cE '\bfrida\b')"
+          echo "  gum:     $(strings $GD/libyam.a | grep -cE '\bgum\b')"
+          echo "  YamXxx:  $(strings $GD/libyam.a | grep -cE 'Yam[A-Z]')"
+          echo "  yam_:    $(strings $GD/libyam.a | grep -c 'yam_')"
+          echo ""
+          echo "=== libyamjs.a ==="
+          echo "  size:    $(du -h $GJD/libyamjs.a | awk '{print $1}')"
+          echo "  members: $(ar t $GJD/libyamjs.a | wc -l)"
+          echo "  frida:   $(strings $GJD/libyamjs.a | grep -cE '\bfrida\b')"
+          echo "  gum:     $(strings $GJD/libyamjs.a | grep -cE '\bgum\b')"
+          echo "  yam_:    $(strings $GJD/libyamjs.a | grep -c 'yam_')"
+          echo "  _ZN2v8:  $(strings $GJD/libyamjs.a | grep -c '_ZN2v8')"
+          echo "  Java.perform: $(strings $GJD/libyamjs.a | grep -c 'Java.perform')"
+
+      - name: Smoke test (C + C++ + JS)
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          GD=/tmp/staging/usr/local/lib/frida-1.0/devkits/gum
+          GJD=/tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs
+          CC=aarch64-linux-android21-clang
+          CXX=aarch64-linux-android21-clang++
+          W=$(mktemp -d) && cd "$W"
+
+          cat > t_c.c << 'EOF'
+          #include "YAM.h"
+          __attribute__((constructor))
+          static void on_load(void) { yam_init_embedded(); }
+          EOF
+
+          cat > t_cpp.cpp << 'EOF'
+          #include "gumpp.hpp"
+          #include "invocationcontext.hpp"
+          #include "invocationlistener.hpp"
+          class L : public Yam::InvocationListener {
+          public:
+              void on_enter(Yam::InvocationContext*) override {}
+              void on_leave(Yam::InvocationContext*) override {}
+          };
+          __attribute__((constructor))
+          static void on_load(void) {
+              yam_init_embedded();
+              auto ic = Yam::Interceptor_obtain();
+              (void) ic;
+          }
+          EOF
+
+          cat > t_js.c << 'EOF'
+          #include "YAMJS.h"
+          __attribute__((constructor))
+          static void on_load(void) {
+              yam_init_embedded();
+              YamScriptBackend * b = yam_script_backend_obtain_qjs();
+              (void) b;
+          }
+          EOF
+
+          echo "--- C ---"
+          $CC -shared -fPIC -I"$GD" t_c.c "$GD/libyam.a" \
+            -llog -ldl -lm -lz -lpthread -static-libstdc++ \
+            -Wl,--gc-sections -o libt_c.so && echo "C OK"
+          echo "--- C++ ---"
+          $CXX -shared -fPIC -std=c++17 -fexceptions -I"$GD" t_cpp.cpp "$GD/libyam.a" \
+            -llog -ldl -lm -lz -lpthread -static-libstdc++ \
+            -Wl,--gc-sections -o libt_cpp.so && echo "C++ OK"
+          echo "--- JS ---"
+          $CC -shared -fPIC -I"$GJD" t_js.c "$GJD/libyamjs.a" \
+            -llog -ldl -lm -lz -lpthread -static-libstdc++ \
+            -Wl,--gc-sections -o libt_js.so && echo "JS OK"
+          ls -lh *.so
+          cd / && rm -rf "$W"
+
+      - name: Package devkit
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          cd /tmp/staging
+          tar -czf /tmp/LIBYAM-devkit-arm64.tar.gz .
+          ls -lh /tmp/LIBYAM-devkit-arm64.tar.gz
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            /tmp/configure.log
+            /tmp/make.log
+            /tmp/install.log
+
+      - name: Upload devkit
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LIBYAM-devkit-arm64
+          path: /tmp/LIBYAM-devkit-arm64.tar.gz

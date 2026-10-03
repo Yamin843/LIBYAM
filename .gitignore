@@ -1,0 +1,6 @@
+build/
+subprojects/packagecache/
+*.log
+*.zip
+*.tar.gz
+.verify/

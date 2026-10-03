@@ -237,6 +237,66 @@ jobs:
           cd / && rm -rf "$WORK"
           echo "=== After merge: libyamjs.a $(du -h $DEVKIT/libyamjs.a | awk '{print $1}'), $(ar t $DEVKIT/libyamjs.a | wc -l) members ==="
 
+      - name: Fix libyamjs.a — inject gvdb members (isolated)
+        if: success()
+        shell: bash
+        run: |
+          set -e
+          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+
+          export LIB=/tmp/staging/usr/local/lib/frida-1.0/devkits/gumjs/libyamjs.a
+          export GIO=/tmp/staging/usr/local/lib/libgio-2.0.a
+
+          if [ ! -f "$LIB" ]; then echo "libyamjs.a missing"; exit 1; fi
+          if [ ! -f "$GIO" ]; then echo "libgio-2.0.a missing"; exit 1; fi
+
+          # Check if any gvdb symbols are undefined in libyamjs.a
+          MISSING=$(nm -u "$LIB" 2>/dev/null | grep -oE '_yamfl_gvdb_[A-Za-z0-9_]+' | sort -u || true)
+          if [ -z "$MISSING" ]; then
+            echo "No undefined gvdb symbols — nothing to do"
+            exit 0
+          fi
+          echo "Undefined gvdb symbols:"
+          echo "$MISSING"
+
+          # Extract the two dot-name gvdb members from libgio-2.0.a via Python (arfile handles dot-names)
+          W=$(mktemp -d)
+          cd "$W"
+
+          python3 << 'INNER'
+          import arfile, os, subprocess, sys
+          lib_gio = os.environ.get("GIO")
+          lib_yam = os.environ.get("LIB")
+          out = []
+          with arfile.open(lib_gio) as ar:
+              for member in ar:
+                  name = member.name
+                  if 'gvdb' not in name.lower():
+                      continue
+                  clean = name.lstrip('.').replace('/', '_')
+                  if not clean.endswith('.o'):
+                      clean += '.o'
+                  # prefix to keep unique
+                  clean = '_injected_' + clean
+                  with open(clean, 'wb') as f:
+                      f.write(member.read())
+                  out.append(clean)
+                  print(f"  extracted: {name} -> {clean}")
+          print(f"  total gvdb members extracted: {len(out)}")
+          INNER
+
+          # Add extracted members to libyamjs.a
+          if ls _injected_*.o >/dev/null 2>&1; then
+            llvm-ar r "$LIB" _injected_*.o
+            echo "  injected into libyamjs.a"
+          fi
+
+          cd / && rm -rf "$W"
+
+          # Verify
+          REMAIN=$(nm -u "$LIB" 2>/dev/null | grep -oE '_yamfl_gvdb_[A-Za-z0-9_]+' | sort -u | wc -l)
+          echo "  remaining undefined gvdb symbols: $REMAIN"
+
       - name: Final verification
         if: success()
         shell: bash
